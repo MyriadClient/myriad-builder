@@ -1,0 +1,212 @@
+# Builds and checks one release for the Myriad Library. The Library API starts it (its private dispatch App) with the
+# submission's number; nothing else does. Everything the steps decide is done by Myriad's signer jar, pinned by hash
+# below; the shell only fetches and calls it.
+#
+# The rules, because this is public and holds the version key:
+# - No job has more permissions than it needs, and the build job (which runs the addon's build) has none and sees no
+#   secret. The version key is only in the sign job, in the `library-sign` environment (main only).
+# - No caches anywhere. Only checked values cross between jobs, as outputs of trusted jobs; the one artifact (the
+#   inspection report) is checked against the inspect job's hash before use.
+# - No ${{ }} inside a `run:` script: values reach scripts through `env:` and are checked again by the signer.
+# - A version is signed without a person only when its build logic is unchanged since a person reviewed its listing,
+#   the released jar is byte for byte what its tagged source builds, its developer signed it, and the inspection finds
+#   nothing new. Anything else waits for review.
+
+name: build
+on:
+  workflow_dispatch:
+    inputs:
+      submission:
+        description: The Library submission's number
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: build-${{ inputs.submission }}
+
+env:
+  API: https://api.myriadclient.dev
+  SUBMISSION: ${{ inputs.submission }}
+  # Myriad's Gradle plugin jar (the signer), from maven.myriadclient.dev. Bump both together.
+  SIGNER_VERSION: '2.8.0'
+  SIGNER_SHA256: 'set-me-when-2.8.0-is-released'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      ok: ${{ steps.prepare.outputs.ok }}
+      problem: ${{ steps.prepare.outputs.problem }}
+      repo: ${{ steps.prepare.outputs.repo }}
+      tag: ${{ steps.prepare.outputs.tag }}
+      commit: ${{ steps.prepare.outputs.commit }}
+      build_hash: ${{ steps.prepare.outputs.build_hash }}
+      asset_url: ${{ steps.prepare.outputs.asset_url }}
+      asset_name: ${{ steps.prepare.outputs.asset_name }}
+      listed: ${{ steps.prepare.outputs.listed }}
+      listing: ${{ steps.prepare.outputs.listing }}
+      accepted: ${{ steps.prepare.outputs.accepted }}
+    steps:
+      - name: setup jdk
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          java-version: '25'
+          distribution: 'microsoft'
+      - name: fetch the signer
+        run: |
+          curl -fsSL --proto '=https' -o "$RUNNER_TEMP/signer.jar" "https://maven.myriadclient.dev/releases/dev/myriadclient/myriad-gradle/$SIGNER_VERSION/myriad-gradle-$SIGNER_VERSION.jar"
+          echo "$SIGNER_SHA256  $RUNNER_TEMP/signer.jar" | sha256sum -c -
+      - name: prepare
+        id: prepare
+        env:
+          BUILDER_TOKEN: ${{ secrets.LIBRARY_BUILDER_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          WORK: ${{ runner.temp }}/work
+        run: java -cp "$RUNNER_TEMP/signer.jar" dev.myriadclient.gradle.signing.Signing builder-prepare
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.ok == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions: {}
+    outputs:
+      sha256: ${{ steps.hash.outputs.sha256 }}
+    env:
+      REPO: ${{ needs.prepare.outputs.repo }}
+      COMMIT: ${{ needs.prepare.outputs.commit }}
+      ASSET_NAME: ${{ needs.prepare.outputs.asset_name }}
+    steps:
+      - name: fetch the source
+        run: |
+          git init --quiet src
+          git -C src fetch --quiet --depth 1 --no-tags "https://github.com/$REPO.git" "$COMMIT"
+          git -C src -c core.hooksPath=/dev/null checkout --quiet --detach FETCH_HEAD
+          test "$(git -C src rev-parse HEAD)" = "$COMMIT"
+      - name: validate the gradle wrapper
+        uses: gradle/actions/wrapper-validation@8da46b539cd8fe6ab27ca75128919a18d757604c # v6
+      - name: setup jdk
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          java-version: '25'
+          distribution: 'microsoft'
+      - name: build
+        working-directory: src
+        run: chmod +x gradlew && ./gradlew --no-daemon --no-build-cache --no-configuration-cache jar
+      - name: hash
+        id: hash
+        run: echo "sha256=$(sha256sum "src/build/libs/$ASSET_NAME" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+  inspect:
+    needs: prepare
+    if: needs.prepare.outputs.ok == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions: {}
+    outputs:
+      summary: ${{ steps.inspect.outputs.summary }}
+      report_sha256: ${{ steps.inspect.outputs.report_sha256 }}
+    env:
+      REPO: ${{ needs.prepare.outputs.repo }}
+      COMMIT: ${{ needs.prepare.outputs.commit }}
+      ASSET_URL: ${{ needs.prepare.outputs.asset_url }}
+    steps:
+      - name: setup jdk
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          java-version: '25'
+          distribution: 'microsoft'
+      - name: fetch the signer
+        run: |
+          curl -fsSL --proto '=https' -o "$RUNNER_TEMP/signer.jar" "https://maven.myriadclient.dev/releases/dev/myriadclient/myriad-gradle/$SIGNER_VERSION/myriad-gradle-$SIGNER_VERSION.jar"
+          echo "$SIGNER_SHA256  $RUNNER_TEMP/signer.jar" | sha256sum -c -
+      - name: inspect the released jar
+        id: inspect
+        env:
+          WORK: ${{ runner.temp }}/work
+        run: java -cp "$RUNNER_TEMP/signer.jar" dev.myriadclient.gradle.signing.Signing builder-inspect
+      - name: keep the report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: report
+          path: ${{ runner.temp }}/work/report.json
+          retention-days: 7
+
+  sign:
+    needs: [prepare, build, inspect]
+    if: needs.prepare.outputs.ok == 'true' && needs.prepare.outputs.listed == 'true' && needs.build.result == 'success' && needs.inspect.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: library-sign
+    permissions: {}
+    outputs:
+      decision: ${{ steps.sign.outputs.decision }}
+      reasons: ${{ steps.sign.outputs.reasons }}
+      version: ${{ steps.sign.outputs.version }}
+    env:
+      LISTING: ${{ needs.prepare.outputs.listing }}
+      ACCEPTED: ${{ needs.prepare.outputs.accepted }}
+      SUMMARY: ${{ needs.inspect.outputs.summary }}
+      BUILD_SHA: ${{ needs.build.outputs.sha256 }}
+      BUILD_HASH: ${{ needs.prepare.outputs.build_hash }}
+      COMMIT: ${{ needs.prepare.outputs.commit }}
+      ASSET_URL: ${{ needs.prepare.outputs.asset_url }}
+    steps:
+      - name: setup jdk
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          java-version: '25'
+          distribution: 'microsoft'
+      - name: fetch the signer
+        run: |
+          curl -fsSL --proto '=https' -o "$RUNNER_TEMP/signer.jar" "https://maven.myriadclient.dev/releases/dev/myriadclient/myriad-gradle/$SIGNER_VERSION/myriad-gradle-$SIGNER_VERSION.jar"
+          echo "$SIGNER_SHA256  $RUNNER_TEMP/signer.jar" | sha256sum -c -
+      - name: sign, if nothing needs a person
+        id: sign
+        env:
+          LIBRARY_VERSION_KEY: ${{ secrets.LIBRARY_VERSION_KEY }}
+        run: java -cp "$RUNNER_TEMP/signer.jar" dev.myriadclient.gradle.signing.Signing builder-sign
+
+  report:
+    needs: [prepare, build, inspect, sign]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: setup jdk
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          java-version: '25'
+          distribution: 'microsoft'
+      - name: fetch the signer
+        run: |
+          curl -fsSL --proto '=https' -o "$RUNNER_TEMP/signer.jar" "https://maven.myriadclient.dev/releases/dev/myriadclient/myriad-gradle/$SIGNER_VERSION/myriad-gradle-$SIGNER_VERSION.jar"
+          echo "$SIGNER_SHA256  $RUNNER_TEMP/signer.jar" | sha256sum -c -
+      - name: fetch the report
+        continue-on-error: true
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: report
+          path: ${{ runner.temp }}/report
+      - name: tell the Library
+        env:
+          BUILDER_TOKEN: ${{ secrets.LIBRARY_BUILDER_TOKEN }}
+          PREPARE_OK: ${{ needs.prepare.outputs.ok }}
+          PROBLEM: ${{ needs.prepare.outputs.problem }}
+          LISTED: ${{ needs.prepare.outputs.listed }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          INSPECT_RESULT: ${{ needs.inspect.result }}
+          DECISION: ${{ needs.sign.outputs.decision }}
+          REASONS: ${{ needs.sign.outputs.reasons }}
+          VERSION: ${{ needs.sign.outputs.version }}
+          REPORT_FILE: ${{ runner.temp }}/report/report.json
+          REPORT_SHA256: ${{ needs.inspect.outputs.report_sha256 }}
+          BUILD_SHA: ${{ needs.build.outputs.sha256 }}
+          BUILD_HASH: ${{ needs.prepare.outputs.build_hash }}
+        run: java -cp "$RUNNER_TEMP/signer.jar" dev.myriadclient.gradle.signing.Signing builder-report
