@@ -31,7 +31,7 @@ env:
   SUBMISSION: ${{ inputs.submission }}
   # Myriad's Gradle plugin jar (the signer), from maven.myriadclient.dev. Bump both together.
   SIGNER_VERSION: '2.8.0'
-  SIGNER_SHA256: 'set-me-when-2.8.0-is-released'
+  SIGNER_SHA256: 'd0d481532d72580d106ff6175e151ea9be7dcb501d4116a92b538e3c253de1f7'
 
 jobs:
   prepare:
